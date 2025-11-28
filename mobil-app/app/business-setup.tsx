@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, SafeAreaView, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { supabase } from '../lib/supabase';
 
@@ -87,14 +87,12 @@ export default function WizardScreen() {
   }, [staffList]);
 
   // --- VERİLERİ GERİ YÜKLEME (MEMORY FETCH) ---
-  useEffect(() => {
-    loadExistingData();
-  }, []);
-
-  const loadExistingData = async () => {
+  const loadExistingData = useCallback(async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { setLoading(false); return; }
+
+      let resolvedTypeKey: keyof typeof BUSINESS_DATA | null = null;
 
       // 1. PROFİL (İşletme Türü ve Saatler)
       const { data: profile } = await supabase.from('profiles').select('business_type, working_hours').eq('id', user.id).single();
@@ -103,8 +101,9 @@ export default function WizardScreen() {
       if (profile?.business_type) {
         const typeKey = Object.keys(BUSINESS_DATA).find(key => BUSINESS_DATA[key as keyof typeof BUSINESS_DATA].name === profile.business_type);
         if (typeKey) {
+          resolvedTypeKey = typeKey as keyof typeof BUSINESS_DATA;
           setSelectedTypeKey(typeKey);
-          setAvailableSkills(BUSINESS_DATA[typeKey as keyof typeof BUSINESS_DATA].defaultSkills || []);
+          setAvailableSkills(BUSINESS_DATA[resolvedTypeKey].defaultSkills || []);
         }
       }
       
@@ -125,9 +124,9 @@ export default function WizardScreen() {
           requiredSkills: s.required_staff_roles || []
         }));
         setServices(mappedServices);
-      } else if (selectedTypeKey) {
+      } else if (resolvedTypeKey) {
           // Kayıt yoksa default yükle
-          const typeData = BUSINESS_DATA[selectedTypeKey as keyof typeof BUSINESS_DATA];
+          const typeData = BUSINESS_DATA[resolvedTypeKey];
           setServices(typeData.defaultServices.map(s => ({ ...s, selected: true, requiredResources: [], requiredSkills: [] })));
       }
 
@@ -164,7 +163,11 @@ export default function WizardScreen() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadExistingData();
+  }, [loadExistingData]);
 
   const notify = (title: string, message: string) => {
     if (Platform.OS === 'web') window.alert(`${title}\n${message}`);
@@ -245,18 +248,28 @@ export default function WizardScreen() {
   };
 
   const openMappingModal = (index: number) => { setEditingServiceIndex(index); setShowMappingModal(true); };
-  const saveMapping = (resource: string | null, skill: string | null) => {
+  const saveMapping = (resource: string | null | undefined, skill: string | null | undefined) => {
     if (editingServiceIndex !== null) {
       const ns = [...services];
       if (resource !== undefined) {
         const current = ns[editingServiceIndex].requiredResources || [];
-        if (current.includes(resource)) ns[editingServiceIndex].requiredResources = current.filter((r:string) => r !== resource);
-        else ns[editingServiceIndex].requiredResources = [...current, resource];
+        if (resource === null) {
+          ns[editingServiceIndex].requiredResources = [];
+        } else if (current.includes(resource)) {
+          ns[editingServiceIndex].requiredResources = current.filter((r:string) => r !== resource);
+        } else {
+          ns[editingServiceIndex].requiredResources = [...current, resource];
+        }
       }
       if (skill !== undefined) {
         const current = ns[editingServiceIndex].requiredSkills || [];
-        if (current.includes(skill)) ns[editingServiceIndex].requiredSkills = current.filter((s:string) => s !== skill);
-        else ns[editingServiceIndex].requiredSkills = [...current, skill];
+        if (skill === null) {
+          ns[editingServiceIndex].requiredSkills = [];
+        } else if (current.includes(skill)) {
+          ns[editingServiceIndex].requiredSkills = current.filter((s:string) => s !== skill);
+        } else {
+          ns[editingServiceIndex].requiredSkills = [...current, skill];
+        }
       }
       setServices(ns);
     }
@@ -383,7 +396,7 @@ export default function WizardScreen() {
   const renderStep3 = () => (
     <View>
       <Text style={styles.headerText}>Hizmet Eşleştirme 🧩</Text>
-      <Text style={styles.subText}>Süreyi ve gereksinimleri ayarla.</Text>
+      <Text style={{ color: '#888', fontSize: 14, marginBottom: 20 }}>Süreyi ve gereksinimleri ayarla.</Text>
       {services.map((service, index) => (
         <View key={index} style={[styles.rowItem, !service.selected && {opacity: 0.5}]}>
           <View style={styles.topRow}>

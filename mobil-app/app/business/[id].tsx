@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Image, SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import React, { useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, Image, SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { supabase } from '../../lib/supabase';
 
 export default function BusinessProfileScreen() {
@@ -10,12 +10,10 @@ export default function BusinessProfileScreen() {
   const [business, setBusiness] = useState<any>(null);
   const [services, setServices] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [favoriteState, setFavoriteState] = useState({ isFavorite: false, checking: true });
+  const [favoriteUserId, setFavoriteUserId] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchBusinessDetails();
-  }, [id]);
-
-  async function fetchBusinessDetails() {
+  const fetchBusinessDetails = useCallback(async () => {
     try {
       // 1. İşletme Profilini Çek
       const { data: profile } = await supabase.from('profiles').select('*').eq('id', id).single();
@@ -30,7 +28,58 @@ export default function BusinessProfileScreen() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [id]);
+
+  const fetchFavoriteStatus = useCallback(async () => {
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user || !id) {
+        setFavoriteState({ isFavorite: false, checking: false });
+        setFavoriteUserId(null);
+        return;
+      }
+      setFavoriteUserId(user.id);
+      const { data } = await supabase
+        .from('favorite_businesses')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('business_id', id)
+        .single();
+      setFavoriteState({ isFavorite: Boolean(data), checking: false });
+    } catch (error) {
+      console.log(error);
+      setFavoriteState({ isFavorite: false, checking: false });
+    }
+  }, [id]);
+
+  const toggleFavorite = useCallback(async () => {
+    if (!favoriteUserId) {
+      Alert.alert('Giriş gerekli', 'Favorilere eklemek için önce giriş yapmalısın.');
+      return;
+    }
+    if (!id) return;
+    try {
+      setFavoriteState((prev) => ({ ...prev, checking: true }));
+      if (favoriteState.isFavorite) {
+        await supabase.from('favorite_businesses').delete().eq('user_id', favoriteUserId).eq('business_id', id);
+        setFavoriteState({ isFavorite: false, checking: false });
+      } else {
+        await supabase.from('favorite_businesses').insert({ user_id: favoriteUserId, business_id: id });
+        setFavoriteState({ isFavorite: true, checking: false });
+      }
+    } catch (error) {
+      console.log(error);
+      Alert.alert('Hata', 'Favori güncellemesi yapılamadı.');
+      setFavoriteState((prev) => ({ ...prev, checking: false }));
+    }
+  }, [favoriteUserId, favoriteState.isFavorite, id]);
+
+  useEffect(() => {
+    fetchBusinessDetails();
+    fetchFavoriteStatus();
+  }, [fetchBusinessDetails, fetchFavoriteStatus]);
 
   // Randevu Sihirbazına Gönder
   const goToBooking = (service: any) => {
@@ -66,6 +115,14 @@ export default function BusinessProfileScreen() {
           <Image source={{ uri: business?.avatar_url || 'https://placehold.co/150' }} style={styles.avatar} />
           <Text style={styles.name}>{business?.business_name || business?.full_name}</Text>
           <Text style={styles.type}>{business?.business_type || 'Güzellik Salonu'}</Text>
+          <TouchableOpacity style={styles.favoriteBtn} onPress={toggleFavorite} disabled={favoriteState.checking}>
+            <Ionicons
+              name={favoriteState.isFavorite ? 'heart' : 'heart-outline'}
+              size={18}
+              color={favoriteState.isFavorite ? '#F44336' : '#fff'}
+            />
+            <Text style={styles.favoriteText}>{favoriteState.isFavorite ? 'Favorilerinde' : 'Favorilere Ekle'}</Text>
+          </TouchableOpacity>
           
           <View style={styles.infoRow}>
              <Ionicons name="time-outline" size={16} color="#888" />
@@ -110,6 +167,8 @@ const styles = StyleSheet.create({
   avatar: { width: 100, height: 100, borderRadius: 50, borderWidth: 2, borderColor: '#0095F6', marginBottom: 15 },
   name: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
   type: { color: '#888', fontSize: 16, marginBottom: 10 },
+  favoriteBtn: { flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 1, borderColor: '#333', borderRadius: 20, paddingHorizontal: 16, paddingVertical: 6, backgroundColor: '#111' },
+  favoriteText: { color: '#fff', fontWeight: '600' },
   infoRow: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#1E1E1E', paddingHorizontal: 15, paddingVertical: 8, borderRadius: 20 },
   infoText: { color: '#ccc' },
 

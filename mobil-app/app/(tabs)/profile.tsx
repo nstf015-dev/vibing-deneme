@@ -1,34 +1,51 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, Platform, SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { supabase } from '../../lib/supabase';
-
-const PORTFOLIO_CATEGORIES = ['Hepsi', 'Saç Boyama', 'Kesim', 'Bakım', 'Makyaj'];
-const ALL_POSTS = [
-  { id: '1', uri: 'https://images.unsplash.com/photo-1560066984-138dadb4c035?w=400&h=400&fit=crop', category: 'Saç Boyama', isVideo: true },
-  { id: '2', uri: 'https://images.unsplash.com/photo-1562322140-8baeececf3df?w=400&h=400&fit=crop', category: 'Kesim', isVideo: false },
-  { id: '3', uri: 'https://images.unsplash.com/photo-1596472537566-8df4e8e80f76?w=400&h=400&fit=crop', category: 'Bakım', isVideo: true },
-  { id: '4', uri: 'https://images.unsplash.com/photo-1522337660859-02fbefca4702?w=400&h=400&fit=crop', category: 'Makyaj', isVideo: false },
-  { id: '5', uri: 'https://images.unsplash.com/photo-1632922267756-9b71242b1592?w=400&h=400&fit=crop', category: 'Saç Boyama', isVideo: false },
-];
 
 export default function ProfileScreen() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<any>(null);
-  
-  const [activeTab, setActiveTab] = useState('posts'); 
+  const [posts, setPosts] = useState<any[]>([]);
+  const [categories, setCategories] = useState<string[]>(['Hepsi']);
+  const [activeTab, setActiveTab] = useState('posts');
   const [selectedCategory, setSelectedCategory] = useState('Hepsi');
 
-  useEffect(() => {
-    getProfile();
+  const fetchPosts = useCallback(async (userId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('posts')
+        .select('id, media_url, service_name, type, created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('Portföy yükleme hatası:', error);
+        return;
+      }
+
+      setPosts(data || []);
+      const uniqueCategories = Array.from(
+        new Set(
+          (data || [])
+            .map((item) => item.service_name)
+            .filter((value): value is string => Boolean(value))
+        )
+      );
+      setCategories(['Hepsi', ...uniqueCategories]);
+    } catch (error) {
+      console.error(error);
+    }
   }, []);
 
-  async function getProfile() {
+  const getProfile = useCallback(async () => {
     try {
       setLoading(true);
-      const { data: { user } } = await supabase.auth.getUser();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
 
       if (!user) {
         router.replace('/welcome');
@@ -45,13 +62,31 @@ export default function ProfileScreen() {
         console.error('Profil çekme hatası:', error);
       } else {
         setProfile(data);
+        await fetchPosts(data.id);
       }
     } catch (error) {
       console.error(error);
     } finally {
       setLoading(false);
     }
-  }
+  }, [router, fetchPosts]);
+
+  useEffect(() => {
+    getProfile();
+  }, [getProfile]);
+
+  useEffect(() => {
+    if (selectedCategory !== 'Hepsi' && !categories.includes(selectedCategory)) {
+      setSelectedCategory('Hepsi');
+    }
+  }, [categories, selectedCategory]);
+
+  const filteredData = useMemo(() => {
+    if (selectedCategory === 'Hepsi') {
+      return posts;
+    }
+    return posts.filter((post) => post.service_name === selectedCategory);
+  }, [posts, selectedCategory]);
 
   // --- ÇIKIŞ YAPMA (WEB VE MOBİL UYUMLU) ---
   const confirmSignOut = () => {
@@ -73,14 +108,10 @@ export default function ProfileScreen() {
   }
   // ------------------------------------------
 
-  const filteredData = selectedCategory === 'Hepsi' 
-    ? ALL_POSTS 
-    : ALL_POSTS.filter(post => post.category === selectedCategory);
-
   const renderGridItem = ({ item }: { item: any }) => (
     <TouchableOpacity style={styles.gridItem}>
-      <Image source={{ uri: item.uri }} style={styles.gridImage} />
-      {item.isVideo && (
+      <Image source={{ uri: item.media_url }} style={styles.gridImage} />
+      {item.type === 'video' && (
         <View style={styles.playIconContainer}>
           <Ionicons name="play" size={16} color="#fff" />
         </View>
@@ -172,7 +203,7 @@ export default function ProfileScreen() {
       {activeTab === 'posts' && (
         <View style={styles.categoryContainer}>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{paddingHorizontal: 10}}>
-            {PORTFOLIO_CATEGORIES.map((cat, index) => (
+            {categories.map((cat, index) => (
               <TouchableOpacity 
                 key={index} 
                 style={[styles.categoryChip, selectedCategory === cat && styles.categoryChipActive]}

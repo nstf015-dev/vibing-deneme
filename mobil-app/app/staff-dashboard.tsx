@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Image, Modal, Platform, SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { supabase } from '../lib/supabase';
 
@@ -60,37 +60,38 @@ export default function StaffDashboardScreen() {
   const [selectedCustomerName, setSelectedCustomerName] = useState('');
   const [customerNote, setCustomerNote] = useState('');
 
-  // --- BAŞLANGIÇ ---
-  useEffect(() => {
-    initDashboard();
+  const calculateStatsAndLoyalty = useCallback((apps: any[], commission: number) => {
+    let earning = 0;
+    const clientCounts: any = {};
+    const uniqueNames = new Set<string>();
+
+    apps.forEach(app => {
+      // Ciro Hesabı
+      if (app.status === 'confirmed') {
+        const price = parseInt(app.price?.replace(/[^0-9]/g, '') || '0');
+        earning += price * ((commission || 40) / 100);
+      }
+      
+      // İsimleri Topla
+      const name = app.client?.full_name || app.guest_name;
+      if (name) {
+        clientCounts[name] = (clientCounts[name] || 0) + 1;
+        uniqueNames.add(name);
+      }
+    });
+
+    // En sadık 5
+    const loyalList = Object.keys(clientCounts)
+      .map(name => ({ name, count: clientCounts[name] }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+
+    setStats({ todayEarnings: earning, appointmentCount: apps.length });
+    setLoyalCustomers(loyalList);
+    setAllCustomerNames(Array.from(uniqueNames));
   }, []);
 
-  async function initDashboard() {
-    try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
-
-      // İşletme Personellerini Çek
-      const { data: staffList } = await supabase.from('staff').select('*').eq('business_id', user.id);
-      
-      // Hizmetleri Çek (Seçim için)
-      const { data: services } = await supabase.from('business_services').select('*').eq('business_id', user.id);
-      setBusinessServices(services || []);
-
-      if (staffList && staffList.length > 0) {
-        setAllStaff(staffList);
-        loadStaffData(staffList[0]); // İlk personeli yükle
-      } else {
-        Alert.alert('Uyarı', 'Personel bulunamadı. Lütfen işletme ayarlarından ekleyin.');
-        setLoading(false);
-      }
-    } catch (error) {
-      console.error(error);
-    }
-  }
-
-  // --- PERSONEL VERİLERİNİ YÜKLE ---
-  async function loadStaffData(staff: any) {
+  const loadStaffData = useCallback(async (staff: any) => {
     setLoading(true);
     setCurrentStaff(staff);
     setModalVisible('none'); // Modalları kapat
@@ -121,39 +122,36 @@ export default function StaffDashboardScreen() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [calculateStatsAndLoyalty]);
 
-  // --- ANALİZ MOTORU ---
-  function calculateStatsAndLoyalty(apps: any[], commission: number) {
-    let earning = 0;
-    const clientCounts: any = {};
-    const uniqueNames = new Set<string>();
+  const initDashboard = useCallback(async () => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
 
-    apps.forEach(app => {
-      // Ciro Hesabı
-      if (app.status === 'confirmed') {
-        const price = parseInt(app.price?.replace(/[^0-9]/g, '') || '0');
-        earning += price * ((commission || 40) / 100);
-      }
+      // İşletme Personellerini Çek
+      const { data: staffList } = await supabase.from('staff').select('*').eq('business_id', user.id);
       
-      // İsimleri Topla
-      const name = app.client?.full_name || app.guest_name;
-      if (name) {
-        clientCounts[name] = (clientCounts[name] || 0) + 1;
-        uniqueNames.add(name);
+      // Hizmetleri Çek (Seçim için)
+      const { data: services } = await supabase.from('business_services').select('*').eq('business_id', user.id);
+      setBusinessServices(services || []);
+
+      if (staffList && staffList.length > 0) {
+        setAllStaff(staffList);
+        await loadStaffData(staffList[0]); // İlk personeli yükle
+      } else {
+        Alert.alert('Uyarı', 'Personel bulunamadı. Lütfen işletme ayarlarından ekleyin.');
+        setLoading(false);
       }
-    });
+    } catch (error) {
+      console.error(error);
+    }
+  }, [loadStaffData]);
 
-    // En sadık 5
-    const loyalList = Object.keys(clientCounts)
-      .map(name => ({ name, count: clientCounts[name] }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 5);
-
-    setStats({ todayEarnings: earning, appointmentCount: apps.length });
-    setLoyalCustomers(loyalList);
-    setAllCustomerNames(Array.from(uniqueNames));
-  }
+  // --- BAŞLANGIÇ ---
+  useEffect(() => {
+    initDashboard();
+  }, [initDashboard]);
 
   // --- İŞLEM FONKSİYONLARI ---
 
@@ -381,7 +379,7 @@ export default function StaffDashboardScreen() {
           <TouchableOpacity onPress={() => setModalVisible('cert')}><Ionicons name="add-circle" size={24} color="#0095F6"/></TouchableOpacity>
         </View>
         {certificates.length === 0 ? (
-          <View style={styles.emptyBox}><Text style={styles.emptyText}>Sertifika eklemek için (+)'ya bas.</Text></View>
+          <View style={styles.emptyBox}><Text style={styles.emptyText}>Sertifika eklemek için (+)’ya bas.</Text></View>
         ) : (
           <ScrollView horizontal showsHorizontalScrollIndicator={false}>
             {certificates.map((cert, i) => (

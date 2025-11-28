@@ -63,7 +63,7 @@ export default function PostScreen() {
 
       // C. Resmi Depoya (Storage) Yükle
       const fileName = `${user.id}/${Date.now()}.jpg`; // Benzersiz isim
-      const { data: uploadData, error: uploadError } = await supabase.storage
+      const { error: uploadError } = await supabase.storage
         .from('posts') // Bucket adı
         .upload(fileName, decode(selectedImage.base64), {
           contentType: 'image/jpeg',

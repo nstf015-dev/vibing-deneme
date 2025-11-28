@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Image, SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { supabase } from '../lib/supabase';
 
@@ -20,6 +20,27 @@ const getNextDays = () => {
   return days;
 };
 
+type TimeSlot = {
+  time: string;
+  disabled: boolean;
+  reason?: 'booked' | 'break';
+};
+
+const generateDaySlots = () => {
+  const slots: TimeSlot[] = [];
+  let currentMinutes = 9 * 60;
+  const endMinutes = 21 * 60;
+  while (currentMinutes < endMinutes) {
+    const h = Math.floor(currentMinutes / 60)
+      .toString()
+      .padStart(2, '0');
+    const m = (currentMinutes % 60).toString().padStart(2, '0');
+    slots.push({ time: `${h}:${m}`, disabled: false });
+    currentMinutes += 30;
+  }
+  return slots;
+};
+
 export default function BookingScreen() {
   const router = useRouter();
   const params = useLocalSearchParams(); 
@@ -27,23 +48,20 @@ export default function BookingScreen() {
 
   const [loading, setLoading] = useState(true);
   const [serviceDetails, setServiceDetails] = useState<any>(null);
+  const [variablePricing, setVariablePricing] = useState<any[]>([]);
+  const [selectedVariables, setSelectedVariables] = useState<Record<string, string>>({});
   
   // Seçimler
   const [staffList, setStaffList] = useState<any[]>([]);
   const [selectedStaff, setSelectedStaff] = useState<any>(null);
   
-  const [days, setDays] = useState(getNextDays());
+  const days = useMemo(() => getNextDays(), []);
   const [selectedDate, setSelectedDate] = useState(days[0]); // Varsayılan bugün
   
-  const [timeSlots, setTimeSlots] = useState<string[]>([]);
+  const [timeSlots, setTimeSlots] = useState<TimeSlot[]>([]);
   const [selectedTime, setSelectedTime] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchServiceAndStaff();
-  }, []);
-
-  // 1. HİZMET DETAYINI VE UYGUN PERSONELİ BUL
-  async function fetchServiceAndStaff() {
+  const fetchServiceAndStaff = useCallback(async () => {
     try {
       // A. Hizmetin süresini ve gereksinimlerini öğren
       const { data: serviceData } = await supabase
@@ -55,27 +73,56 @@ export default function BookingScreen() {
 
       setServiceDetails(serviceData);
 
-      // B. Bu hizmeti yapabilen personelleri bul
-      const { data: allStaff } = await supabase
-        .from('staff')
-        .select('*')
-        .eq('business_id', params.business_id);
+      // Variable pricing çek
+      if (serviceData?.id) {
+        const { data: pricingData } = await supabase
+          .from('service_variable_pricing')
+          .select('*')
+          .eq('service_id', serviceData.id);
+        setVariablePricing(pricingData || []);
+      }
 
-      if (allStaff) {
-        // Eğer hizmetin özel bir yetenek gereksinimi varsa filtrele
-        const requiredRoles = serviceData?.required_staff_roles || [];
-        
-        const filteredStaff = allStaff.filter(staff => {
-          // Eğer hizmet herkes tarafından yapılabiliyorsa (liste boşsa) -> Ekle
-          if (!requiredRoles || requiredRoles.length === 0) return true;
-          
-          // Personelin yetenekleri arasında, hizmetin istediği yeteneklerden BİRİ var mı?
-          const staffSkills = staff.skills || [];
-          // Kesişim kümesi kontrolü (En az bir yetenek eşleşmeli)
-          return requiredRoles.some((role: string) => staffSkills.includes(role));
-        });
+      // B. Bu hizmeti yapabilen personelleri bul (staff_services tablosunu kullan)
+      const { data: serviceIdData } = await supabase
+        .from('business_services')
+        .select('id')
+        .eq('business_id', params.business_id)
+        .eq('name', params.service_name)
+        .single();
 
-        setStaffList(filteredStaff);
+      if (serviceIdData?.id) {
+        // staff_services tablosundan bu hizmeti yapabilen personelleri bul
+        const { data: staffServicesData } = await supabase
+          .from('staff_services')
+          .select('staff_id')
+          .eq('service_id', serviceIdData.id);
+
+        if (staffServicesData && staffServicesData.length > 0) {
+          const staffIds = staffServicesData.map((s: any) => s.staff_id);
+          const { data: assignedStaff } = await supabase
+            .from('staff')
+            .select('*')
+            .eq('business_id', params.business_id)
+            .in('id', staffIds);
+
+          setStaffList(assignedStaff || []);
+        } else {
+          // Eğer staff_services'de kayıt yoksa, eski yöntemi kullan (geriye dönük uyumluluk)
+          const { data: allStaff } = await supabase
+            .from('staff')
+            .select('*')
+            .eq('business_id', params.business_id);
+
+          if (allStaff) {
+            const requiredRoles = serviceData?.required_staff_roles || [];
+            const filteredStaff = allStaff.filter(staff => {
+              if (!requiredRoles || requiredRoles.length === 0) return true;
+              const staffSkills = staff.skills || [];
+              return requiredRoles.some((role: string) => staffSkills.includes(role));
+            });
+            setStaffList(filteredStaff);
+          }
+        }
       }
 
       setLoading(false);
@@ -83,63 +130,147 @@ export default function BookingScreen() {
       console.error(error);
       setLoading(false);
     }
-  }
+  }, [params.business_id, params.service_name]);
+
+  useEffect(() => {
+    fetchServiceAndStaff();
+  }, [fetchServiceAndStaff]);
 
   // 2. MÜSAİT SAATLERİ HESAPLA (MATRİX LOGIC) 🧠
-  useEffect(() => {
-    if (selectedStaff && selectedDate) {
-      calculateAvailableSlots();
-    }
-  }, [selectedStaff, selectedDate]);
+  const calculateAvailableSlots = useCallback(async () => {
+    if (!selectedStaff || !selectedDate || !serviceDetails) return;
 
-  async function calculateAvailableSlots() {
-    // Seçilen günün tarih formatı: "Bugün, 14:00" gibi basit tutmuştuk, 
-    // ama veritabanında tarih sorgusu için YYYY-MM-DD lazım.
-    // Basitlik adına şimdilik "Bugün" ise bugünün tarihi, yoksa seçilen tarih varsayıyoruz.
-    
-    const dateKey = selectedDate.dateString; // 2023-11-24
+    const serviceDuration = serviceDetails.duration || 30;
+    const paddingTime = serviceDetails.padding_time || 0;
+    const totalDuration = serviceDuration + paddingTime; // Toplam süre (hizmet + temizlik)
 
-    // A. Personelin o günkü randevularını çek
     const { data: appointments } = await supabase
       .from('appointments')
-      .select('date, status')
+      .select('date, status, service_name')
       .eq('staff_id', selectedStaff.id)
       .eq('status', 'confirmed')
-      .ilike('date', `%${selectedDate.dayNumber}%`); // Basit bir eşleşme (Geliştirilebilir)
+      .ilike('date', `%${selectedDate.dateString}%`);
 
-    // B. Personelin Molalarını Çek
     const { data: breaks } = await supabase
       .from('staff_breaks')
       .select('start_time')
       .eq('staff_id', selectedStaff.id);
 
-    // C. Saatleri Oluştur
-    const duration = serviceDetails?.duration || 30; // Hizmet süresi (dk)
-    const slots = [];
-    
-    // Dükkan 09:00 - 21:00 arası açık varsayalım (Bunu da profilden çekebiliriz)
-    let currentMinutes = 9 * 60; // 09:00
-    const endMinutes = 21 * 60;  // 21:00
+    // Vardiya kontrolü
+    const { data: shifts } = await supabase
+      .from('staff_shifts')
+      .select('start_time, end_time, break_start, break_end, is_available')
+      .eq('staff_id', selectedStaff.id)
+      .eq('shift_date', selectedDate.dateString);
 
-    while (currentMinutes + duration <= endMinutes) {
-      const h = Math.floor(currentMinutes / 60).toString().padStart(2, '0');
-      const m = (currentMinutes % 60).toString().padStart(2, '0');
-      const timeString = `${h}:${m}`;
+    // Tüm randevuların hizmet detaylarını önceden çek
+    const appointmentServices: Record<string, { duration: number; padding_time: number }> = {};
+    if (appointments && appointments.length > 0) {
+      const uniqueServiceNames = [...new Set(appointments.map((app) => app.service_name))];
+      const { data: servicesData } = await supabase
+        .from('business_services')
+        .select('name, duration, padding_time')
+        .eq('business_id', params.business_id)
+        .in('name', uniqueServiceNames);
 
-      // DOLULUK KONTROLÜ
-      // Bu saatte randevu var mı? (Basit string kontrolü yapıyoruz şimdilik)
-      const isBooked = appointments?.some(app => app.date.includes(timeString));
-      const isBreak = breaks?.some(brk => brk.start_time === timeString);
-
-      if (!isBooked && !isBreak) {
-        slots.push(timeString);
+      if (servicesData) {
+        servicesData.forEach((svc) => {
+          appointmentServices[svc.name] = {
+            duration: svc.duration || 30,
+            padding_time: svc.padding_time || 0,
+          };
+        });
       }
-
-      currentMinutes += 30; // Slot aralığı (Müşteri 30dk arayla seçebilsin)
     }
 
-    setTimeSlots(slots);
-  }
+    const baseSlots = generateDaySlots();
+    const updatedSlots: TimeSlot[] = baseSlots.map((slot) => {
+      // Vardiya kontrolü
+      const shift = shifts?.[0];
+      if (shift && !shift.is_available) {
+        return { ...slot, disabled: true, reason: 'break' as const };
+      }
+      if (shift) {
+        const slotMinutes = parseInt(slot.time.split(':')[0]) * 60 + parseInt(slot.time.split(':')[1]);
+        const shiftStartMinutes = parseInt(shift.start_time.split(':')[0]) * 60 + parseInt(shift.start_time.split(':')[1]);
+        const shiftEndMinutes = parseInt(shift.end_time.split(':')[0]) * 60 + parseInt(shift.end_time.split(':')[1]);
+        
+        if (slotMinutes < shiftStartMinutes || slotMinutes + totalDuration > shiftEndMinutes) {
+          return { ...slot, disabled: true, reason: 'break' as const };
+        }
+
+        // Mola kontrolü
+        if (shift.break_start && shift.break_end) {
+          const breakStartMinutes = parseInt(shift.break_start.split(':')[0]) * 60 + parseInt(shift.break_start.split(':')[1]);
+          const breakEndMinutes = parseInt(shift.break_end.split(':')[0]) * 60 + parseInt(shift.break_end.split(':')[1]);
+          
+          if (slotMinutes < breakEndMinutes && slotMinutes + totalDuration > breakStartMinutes) {
+            return { ...slot, disabled: true, reason: 'break' as const };
+          }
+        }
+      }
+
+      // Randevu çakışma kontrolü (padding time dahil)
+      const isBooked = appointments?.some((app) => {
+        if (!app.date) return false;
+        const appTimeMatch = app.date.match(/(\d{2}):(\d{2})/);
+        if (!appTimeMatch) return false;
+        
+        const appMinutes = parseInt(appTimeMatch[1]) * 60 + parseInt(appTimeMatch[2]);
+        const slotMinutes = parseInt(slot.time.split(':')[0]) * 60 + parseInt(slot.time.split(':')[1]);
+        
+        // Önceden çekilen hizmet detaylarını kullan
+        const appService = appointmentServices[app.service_name] || { duration: 30, padding_time: 0 };
+        const appDuration = appService.duration + appService.padding_time;
+        
+        // Çakışma kontrolü: Yeni randevu başlangıcı, mevcut randevunun bitişinden önce olmamalı
+        return slotMinutes < appMinutes + appDuration && slotMinutes + totalDuration > appMinutes;
+      });
+
+      const isBreak = breaks?.some((brk) => brk.start_time === slot.time);
+      
+      if (isBooked || isBreak) {
+        return {
+          ...slot,
+          disabled: true,
+          reason: (isBooked ? 'booked' : 'break') as 'booked' | 'break',
+        };
+      }
+      return slot;
+    });
+
+    setTimeSlots(updatedSlots);
+    setSelectedTime((prev) => {
+      if (!prev) return prev;
+      const stillAvailable = updatedSlots.find((slot) => slot.time === prev && !slot.disabled);
+      return stillAvailable ? prev : null;
+    });
+  }, [selectedDate, selectedStaff, serviceDetails, params.business_id]);
+
+  useEffect(() => {
+    if (selectedStaff && selectedDate) {
+      calculateAvailableSlots();
+    }
+  }, [selectedStaff, selectedDate, calculateAvailableSlots]);
+
+  // Fiyat hesaplama (variable pricing dahil)
+  const calculateTotalPrice = useMemo(() => {
+    if (!serviceDetails) return params.price || '0₺';
+    
+    let basePrice = serviceDetails.base_price || parseFloat((serviceDetails.price || '0').replace(/[^0-9.]/g, '')) || 0;
+    
+    // Variable pricing eklemeleri
+    Object.values(selectedVariables).forEach((optionName) => {
+      const variable = variablePricing.find(
+        (vp) => vp.option_name === optionName
+      );
+      if (variable) {
+        basePrice += variable.price_modifier;
+      }
+    });
+
+    return `${basePrice.toFixed(0)}₺`;
+  }, [serviceDetails, selectedVariables, variablePricing, params.price]);
 
   // 3. RANDEVUYU ONAYLA
   async function confirmBooking() {
@@ -164,16 +295,20 @@ export default function BookingScreen() {
         business_id: params.business_id,
         staff_id: selectedStaff.id,
         service_name: params.service_name,
-        price: params.price,
+        price: calculateTotalPrice,
         date: prettyDate,
         status: 'pending' // Onay bekliyor
       });
 
       if (error) throw error;
 
-      Alert.alert('Harika! 🎉', 'Randevu talebin iletildi. İşletme onaylayınca bildirim alacaksın.', [
-        { text: 'Tamam', onPress: () => router.replace('/(tabs)/appointments') }
-      ]);
+      const staffName = selectedStaff.full_name || selectedStaff.name || 'personel';
+      const businessName = params.business_name || 'işletme';
+      Alert.alert(
+        'Harika! 🎉',
+        `${businessName} / ${staffName} için randevu talebin alındı. İşletme onaylayınca bildirim alacaksın.`,
+        [{ text: 'Tamam', onPress: () => router.replace('/(tabs)/appointments') }]
+      );
 
     } catch (error: any) {
       Alert.alert('Hata', error.message);
@@ -203,11 +338,60 @@ export default function BookingScreen() {
             <Text style={styles.businessName}>@{params.business_name}</Text>
             <View style={styles.durationBadge}>
               <Ionicons name="time-outline" size={12} color="#ccc" />
-              <Text style={styles.durationText}>{serviceDetails?.duration || 30} dk</Text>
+              <Text style={styles.durationText}>
+                {serviceDetails?.duration || 30} dk
+                {serviceDetails?.padding_time && serviceDetails.padding_time > 0 && (
+                  <Text style={{ color: '#888' }}> + {serviceDetails.padding_time} dk temizlik</Text>
+                )}
+              </Text>
             </View>
+            {serviceDetails?.description && (
+              <Text style={styles.serviceDescription}>{serviceDetails.description}</Text>
+            )}
           </View>
-          <Text style={styles.price}>{params.price}</Text>
+          <Text style={styles.price}>{calculateTotalPrice}</Text>
         </View>
+
+        {/* DEĞİŞKEN FİYATLANDIRMA */}
+        {variablePricing.length > 0 && (
+          <>
+            <Text style={styles.sectionTitle}>Seçenekler</Text>
+            {Object.entries(
+              variablePricing.reduce((acc: Record<string, any[]>, vp) => {
+                if (!acc[vp.variable_name]) acc[vp.variable_name] = [];
+                acc[vp.variable_name].push(vp);
+                return acc;
+              }, {})
+            ).map(([variableName, options]) => (
+              <View key={variableName} style={styles.variableGroup}>
+                <Text style={styles.variableLabel}>{variableName}</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.optionsScroll}>
+                  {options.map((option) => {
+                    const isSelected = selectedVariables[variableName] === option.option_name;
+                    return (
+                      <TouchableOpacity
+                        key={option.id}
+                        style={[styles.optionChip, isSelected && styles.optionChipSelected]}
+                        onPress={() => {
+                          setSelectedVariables((prev) => ({
+                            ...prev,
+                            [variableName]: isSelected ? '' : option.option_name,
+                          }));
+                        }}>
+                        <Text style={[styles.optionText, isSelected && styles.optionTextSelected]}>
+                          {option.option_name}
+                        </Text>
+                        <Text style={[styles.optionPrice, isSelected && styles.optionPriceSelected]}>
+                          {option.price_modifier >= 0 ? '+' : ''}{option.price_modifier}₺
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              </View>
+            ))}
+          </>
+        )}
 
         {/* 1. PERSONEL SEÇİMİ */}
         <Text style={styles.sectionTitle}>Uzman Seç</Text>
@@ -251,21 +435,34 @@ export default function BookingScreen() {
         {selectedStaff && (
           <>
             <Text style={styles.sectionTitle}>Saat Seç</Text>
-            {timeSlots.length === 0 ? (
-              <Text style={{color:'#666'}}>Bugün için boş saat kalmadı.</Text>
-            ) : (
-              <View style={styles.slotsGrid}>
-                {timeSlots.map((slot, index) => (
+            <View style={styles.slotsGrid}>
+              {timeSlots.map((slot, index) => {
+                const isSelected = selectedTime === slot.time;
+                return (
                   <TouchableOpacity
                     key={index}
-                    style={[styles.slot, selectedTime === slot && styles.selectedSlot]}
-                    onPress={() => setSelectedTime(slot)}
-                  >
-                    <Text style={[styles.slotText, selectedTime === slot && styles.selectedSlotText]}>{slot}</Text>
+                    style={[
+                      styles.slot,
+                      isSelected && styles.selectedSlot,
+                      slot.disabled && styles.disabledSlot,
+                    ]}
+                    onPress={() => !slot.disabled && setSelectedTime(slot.time)}
+                    disabled={slot.disabled}>
+                    <Text
+                      style={[
+                        styles.slotText,
+                        isSelected && styles.selectedSlotText,
+                        slot.disabled && styles.disabledSlotText,
+                      ]}>
+                      {slot.time}
+                    </Text>
+                    {slot.disabled && (
+                      <Text style={styles.slotBadge}>{slot.reason === 'booked' ? 'Dolu' : 'Mola'}</Text>
+                    )}
                   </TouchableOpacity>
-                ))}
-              </View>
-            )}
+                );
+              })}
+            </View>
           </>
         )}
 
@@ -275,15 +472,43 @@ export default function BookingScreen() {
       <View style={styles.footer}>
         <View style={{flex:1}}>
           <Text style={styles.totalLabel}>Toplam</Text>
-          <Text style={styles.totalPrice}>{params.price}</Text>
+          <Text style={styles.totalPrice}>{calculateTotalPrice}</Text>
         </View>
-        <TouchableOpacity 
-          style={[styles.confirmBtn, (!selectedStaff || !selectedTime) && {backgroundColor:'#333'}]} 
-          onPress={confirmBooking}
-          disabled={!selectedStaff || !selectedTime}
-        >
-          <Text style={[styles.confirmText, (!selectedStaff || !selectedTime) && {color:'#666'}]}>Onayla</Text>
-        </TouchableOpacity>
+        <View style={styles.footerButtons}>
+          <TouchableOpacity 
+            style={styles.waitlistBtn}
+            onPress={() => router.push({
+              pathname: '/waitlist',
+              params: {
+                business_id: params.business_id,
+                service_name: params.service_name,
+              }
+            })}
+          >
+            <Ionicons name="time-outline" size={16} color="#0095F6" />
+            <Text style={styles.waitlistText}>Bekleme Listesi</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={styles.multiServiceBtn}
+            onPress={() => router.push({
+              pathname: '/multi-service-booking',
+              params: {
+                business_id: params.business_id,
+                service_name: params.service_name,
+              }
+            })}
+          >
+            <Ionicons name="add-circle-outline" size={16} color="#9C27B0" />
+            <Text style={styles.multiServiceText}>Hizmet Ekle</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.confirmBtn, (!selectedStaff || !selectedTime) && {backgroundColor:'#333'}]} 
+            onPress={confirmBooking}
+            disabled={!selectedStaff || !selectedTime}
+          >
+            <Text style={[styles.confirmText, (!selectedStaff || !selectedTime) && {color:'#666'}]}>Onayla</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
     </SafeAreaView>
@@ -300,9 +525,31 @@ const styles = StyleSheet.create({
   serviceCard: { backgroundColor: '#1E1E1E', padding: 20, borderRadius: 16, marginBottom: 25, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   serviceName: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
   businessName: { color: '#888', marginTop: 4, fontSize: 14 },
+  serviceDescription: { color: '#aaa', fontSize: 13, marginTop: 8, lineHeight: 18 },
   durationBadge: { flexDirection: 'row', alignItems: 'center', marginTop: 8, backgroundColor: '#333', alignSelf: 'flex-start', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8 },
   durationText: { color: '#ccc', fontSize: 12, marginLeft: 4 },
   price: { color: '#4CAF50', fontWeight: 'bold', fontSize: 20 },
+  variableGroup: { marginBottom: 20 },
+  variableLabel: { color: '#fff', fontSize: 14, fontWeight: '600', marginBottom: 10 },
+  optionsScroll: { marginBottom: 10 },
+  optionChip: {
+    backgroundColor: '#1E1E1E',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+    marginRight: 10,
+    borderWidth: 1,
+    borderColor: '#333',
+    alignItems: 'center',
+  },
+  optionChipSelected: {
+    backgroundColor: '#0095F6',
+    borderColor: '#0095F6',
+  },
+  optionText: { color: '#fff', fontSize: 14, fontWeight: '600', marginBottom: 2 },
+  optionTextSelected: { color: '#000' },
+  optionPrice: { color: '#888', fontSize: 12 },
+  optionPriceSelected: { color: '#000' },
 
   sectionTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 15, marginTop: 10 },
   
@@ -323,12 +570,41 @@ const styles = StyleSheet.create({
   slotsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
   slot: { width: '22%', paddingVertical: 12, borderRadius: 8, borderWidth: 1, borderColor: '#333', alignItems: 'center', backgroundColor: '#1E1E1E' },
   selectedSlot: { backgroundColor: '#0095F6', borderColor: '#0095F6' },
+  disabledSlot: { opacity: 0.5, borderColor: '#222', backgroundColor: '#151515' },
   slotText: { color: '#fff', fontWeight: '600' },
   selectedSlotText: { color: '#fff' },
+  disabledSlotText: { color: '#777' },
+  slotBadge: { color: '#ccc', fontSize: 10, marginTop: 4 },
 
-  footer: { position: 'absolute', bottom: 0, width: '100%', padding: 20, paddingBottom: 30, backgroundColor: '#1E1E1E', borderTopWidth: 1, borderTopColor: '#333', flexDirection: 'row', alignItems: 'center' },
-  totalLabel: { color: '#888', fontSize: 12 },
-  totalPrice: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
-  confirmBtn: { backgroundColor: '#fff', paddingVertical: 14, paddingHorizontal: 30, borderRadius: 30, alignItems: 'center' },
+  footer: { position: 'absolute', bottom: 0, width: '100%', padding: 20, paddingBottom: 30, backgroundColor: '#1E1E1E', borderTopWidth: 1, borderTopColor: '#333' },
+  footerButtons: { flexDirection: 'row', gap: 10, alignItems: 'center' },
+  totalLabel: { color: '#888', fontSize: 12, marginBottom: 4 },
+  totalPrice: { color: '#fff', fontSize: 24, fontWeight: 'bold', marginBottom: 10 },
+  waitlistBtn: { 
+    flexDirection: 'row', 
+    alignItems: 'center', 
+    gap: 6, 
+    backgroundColor: '#111', 
+    paddingVertical: 12, 
+    paddingHorizontal: 16, 
+    borderRadius: 30, 
+    borderWidth: 1, 
+    borderColor: '#0095F6' 
+  },
+  waitlistText: { color: '#0095F6', fontWeight: '600', fontSize: 14 },
+  multiServiceBtn: { 
+    flexDirection: 'row', 
+    alignItems: 'center', 
+    gap: 6, 
+    backgroundColor: '#111', 
+    paddingVertical: 12, 
+    paddingHorizontal: 16, 
+    borderRadius: 30, 
+    borderWidth: 1, 
+    borderColor: '#9C27B0',
+    marginTop: 8,
+  },
+  multiServiceText: { color: '#9C27B0', fontWeight: '600', fontSize: 14 },
+  confirmBtn: { flex: 1, backgroundColor: '#fff', paddingVertical: 14, paddingHorizontal: 30, borderRadius: 30, alignItems: 'center' },
   confirmText: { color: '#000', fontWeight: 'bold', fontSize: 16 },
 });

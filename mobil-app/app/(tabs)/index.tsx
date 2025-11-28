@@ -1,186 +1,536 @@
 import { Ionicons } from '@expo/vector-icons';
 import { ResizeMode, Video } from 'expo-av';
-import { useRouter } from 'expo-router'; // Yönlendirme için bunu ekledik
-import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Dimensions, FlatList, Image, RefreshControl, SafeAreaView, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { useRouter } from 'expo-router';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Animated,
+  Dimensions,
+  FlatList,
+  Image,
+  Modal,
+  RefreshControl,
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+  ViewToken,
+} from 'react-native';
 import { supabase } from '../../lib/supabase';
+import { generateFeed } from '../../services/social/feed-generator';
+import { initializeBookingFromPost } from '../../services/social/book-this-look';
+import { useSocialStore } from '../../store/contexts/SocialContext';
 
-const { width } = Dimensions.get('window');
+const { width, height } = Dimensions.get('window');
 
 export default function HomeScreen() {
-  const router = useRouter(); // Router'ı tanımladık
-  const [posts, setPosts] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const router = useRouter();
+  const { feed, setFeed, appendFeed, currentIndex, setCurrentIndex, toggleLike, setLoading, setHasMore, setCursor, resetFeed, cursor } = useSocialStore();
   const [refreshing, setRefreshing] = useState(false);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [commentModal, setCommentModal] = useState<{ visible: boolean; postId: string | null }>({ visible: false, postId: null });
+  const [newComment, setNewComment] = useState('');
+  const [postComments, setPostComments] = useState<Record<string, any[]>>({});
+  const [viewableItems, setViewableItems] = useState<ViewToken[]>([]);
+  const flatListRef = useRef<FlatList>(null);
+  const videoRefs = useRef<Record<string, any>>({});
 
   useEffect(() => {
-    fetchPosts();
+    fetchUserAndPosts();
   }, []);
 
-  async function fetchPosts() {
+  const fetchUserAndPosts = useCallback(async () => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) setCurrentUserId(user.id);
+
+      await loadFeed();
+    } catch (error) {
+      console.error('Initial load error:', error);
+    }
+  }, []);
+
+  const loadFeed = useCallback(async (cursor?: string) => {
     try {
       setLoading(true);
-      const { data, error } = await supabase
-        .from('posts')
-        .select(`
-          *,
-          profiles (
-            full_name,
-            business_name,
-            avatar_url,
-            role
-          )
-        `)
-        .order('created_at', { ascending: false });
+      const { data: { user } } = await supabase.auth.getUser();
+      
+      const { posts, nextCursor } = await generateFeed({
+        userId: user?.id,
+        limit: 10,
+        cursor,
+      });
 
-      if (error) console.error('Post hatası:', error);
-      else setPosts(data || []);
+      // Enrich posts with user like status and comments
+      const enriched = await Promise.all(posts.map(async (post) => {
+        const [userLikeRes, commentsRes] = await Promise.all([
+          user ? supabase.from('post_likes').select('id').eq('post_id', post.id).eq('user_id', user.id).single() : Promise.resolve({ data: null }),
+          supabase.from('post_comments').select('*, profiles(full_name, avatar_url)').eq('post_id', post.id).order('created_at', { ascending: false }).limit(3),
+        ]);
+
+        return {
+          ...post,
+          is_liked: Boolean(userLikeRes.data),
+          recent_comments: commentsRes.data || [],
+        };
+      }));
+
+      if (cursor) {
+        appendFeed(enriched);
+      } else {
+        setFeed(enriched);
+      }
+
+      setHasMore(!!nextCursor);
+      setCursor(nextCursor);
     } catch (error) {
-      console.error(error);
+      console.error('Feed yükleme hatası:', error);
+      Alert.alert('Hata', 'Feed yüklenemedi. Lütfen tekrar deneyin.');
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }
+  }, [setFeed, appendFeed, setLoading, setHasMore, setCursor]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchPosts();
-  }, []);
+    resetFeed();
+    loadFeed();
+  }, [loadFeed, resetFeed]);
 
-  // --- İŞTE DÜZELTİLMİŞ YENİ FONKSİYON ---
-  // Artık direkt randevu almıyor, 'booking' sayfasına yönlendiriyor.
-  function handleBookAppointment(post: any) {
-    const user = post.profiles || {}; // Post sahibi (İşletme)
+  const onEndReached = useCallback(() => {
+    if (!feed.length || refreshing) return;
+    if (cursor) {
+      loadFeed(cursor);
+    }
+  }, [feed.length, refreshing, loadFeed, cursor]);
 
-    router.push({
-      pathname: '/booking',
-      params: {
-        business_id: post.user_id, // İşletmenin ID'si
-        business_name: user.business_name || user.full_name,
-        service_name: post.service_name || 'Genel Hizmet',
-        price: post.price || 'Fiyat Sorunuz'
+  const handleBookThisLook = useCallback(async (postId: string) => {
+    try {
+      const success = await initializeBookingFromPost(postId, router);
+      if (!success) {
+        Alert.alert('Hata', 'Bu gönderi için rezervasyon yapılamıyor.');
+      }
+    } catch (error: any) {
+      Alert.alert('Hata', error.message || 'Rezervasyon başlatılamadı.');
+    }
+  }, [router]);
+
+  const handleToggleLike = useCallback(async (postId: string) => {
+    if (!currentUserId) {
+      Alert.alert('Giriş Gerekli', 'Beğenmek için lütfen giriş yapın.');
+      return;
+    }
+
+    await toggleLike(postId);
+
+    // API call
+    try {
+      const { data: existing } = await supabase
+        .from('post_likes')
+        .select('id')
+        .eq('post_id', postId)
+        .eq('user_id', currentUserId)
+        .single();
+
+      if (existing) {
+        await supabase.from('post_likes').delete().eq('id', existing.id);
+      } else {
+        await supabase.from('post_likes').insert({
+          post_id: postId,
+          user_id: currentUserId,
+        });
+      }
+    } catch (error) {
+      console.error('Like error:', error);
+    }
+  }, [currentUserId, toggleLike]);
+
+  const handleAddComment = useCallback(async () => {
+    if (!commentModal.postId || !currentUserId || !newComment.trim()) return;
+
+    try {
+      const { error } = await supabase.from('post_comments').insert({
+        post_id: commentModal.postId,
+        user_id: currentUserId,
+        comment: newComment.trim(),
+      });
+
+      if (error) throw error;
+
+      // Refresh comments
+      const { data: comments } = await supabase
+        .from('post_comments')
+        .select('*, profiles(full_name, avatar_url)')
+        .eq('post_id', commentModal.postId)
+        .order('created_at', { ascending: false })
+        .limit(3);
+
+      setPostComments((prev) => ({
+        ...prev,
+        [commentModal.postId!]: comments || [],
+      }));
+
+      setNewComment('');
+      setCommentModal({ visible: false, postId: null });
+    } catch (error: any) {
+      Alert.alert('Hata', error.message || 'Yorum eklenemedi.');
+    }
+  }, [commentModal, currentUserId, newComment]);
+
+  const onViewableItemsChanged = useRef(({ viewableItems: vItems }: { viewableItems: ViewToken[] }) => {
+    setViewableItems(vItems);
+    
+    // Auto-play video for visible item
+    vItems.forEach((item) => {
+      if (item.item && item.item.media_type === 'video') {
+        const videoRef = videoRefs.current[item.item.id];
+        if (videoRef && item.isViewable) {
+          videoRef.playAsync();
+        }
       }
     });
-  }
-  // ----------------------------------------
 
-  const renderPost = ({ item }: { item: any }) => {
-    const user = item.profiles || {};
-    const displayName = user.role === 'business' ? user.business_name : user.full_name;
+    // Pause videos that are not visible
+    feed.forEach((post) => {
+      if (post.media_type === 'video') {
+        const isVisible = vItems.some((vi) => vi.item?.id === post.id && vi.isViewable);
+        const videoRef = videoRefs.current[post.id];
+        if (videoRef && !isVisible) {
+          videoRef.pauseAsync();
+        }
+      }
+    });
+  }).current;
+
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 50,
+  }).current;
+
+  const renderPost = ({ item, index }: { item: any; index: number }) => {
+    const isVisible = viewableItems.some((vi) => vi.item?.id === item.id && vi.isViewable);
+    const hasServiceLink = item.service_link;
 
     return (
-      <View style={styles.card}>
-        <View style={styles.header}>
-          {/* PROFİLE GİTMEK İÇİN TIKLANABİLİR ALAN */}
-          <TouchableOpacity 
-            style={styles.userInfo} 
-            onPress={() => router.push(`/business/${post.user_id}`)} // YENİ YÖNLENDİRME
-          >
-            <Image source={{ uri: user.avatar_url || 'https://placehold.co/150' }} style={styles.avatar} />
-            <View>
-              <Text style={styles.username}>{displayName}</Text>
-              {user.role === 'business' && <Text style={styles.badge}>İşletme Hesabı</Text>}
-            </View>
-          </TouchableOpacity>
-          <Ionicons name="ellipsis-horizontal" size={20} color="#fff" />
-        </View>
-        
+      <View style={styles.postContainer}>
+        {/* MEDIA */}
         <View style={styles.mediaContainer}>
-          {item.type === 'video' ? (
+          {item.media_type === 'video' ? (
             <Video
-              style={styles.media}
+              ref={(ref) => {
+                if (ref) videoRefs.current[item.id] = ref;
+              }}
               source={{ uri: item.media_url }}
-              useNativeControls
+              style={styles.media}
               resizeMode={ResizeMode.COVER}
-              shouldPlay={false}
+              shouldPlay={isVisible && index === currentIndex}
+              isLooping
+              isMuted={false}
             />
           ) : (
-            <Image source={{ uri: item.media_url }} style={styles.media} />
+            <Image source={{ uri: item.media_url }} style={styles.media} resizeMode="cover" />
           )}
-        </View>
 
-        <View style={styles.footer}>
-          <View style={styles.actionRow}>
-            <View style={styles.leftActions}>
-              <TouchableOpacity style={styles.actionButton}><Ionicons name="heart-outline" size={26} color="#fff" /></TouchableOpacity>
-              <TouchableOpacity style={styles.actionButton}><Ionicons name="chatbubble-outline" size={24} color="#fff" /></TouchableOpacity>
-            </View>
-            
-            {/* Buton artık yeni fonksiyona bağlı */}
-            <TouchableOpacity style={styles.bookButton} onPress={() => handleBookAppointment(item)}>
-              <Text style={styles.bookButtonText}>Randevu Al</Text>
+          {/* OVERLAY GRADIENT */}
+          <View style={styles.overlayGradient} />
+
+          {/* RIGHT SIDE ACTIONS */}
+          <View style={styles.rightActions}>
+            {/* PROFILE AVATAR */}
+            <TouchableOpacity
+              onPress={() => router.push(`/business/${item.business_id || item.user_id}`)}
+              style={styles.avatarButton}>
+              <Image
+                source={{ uri: item.user?.avatar_url || 'https://via.placeholder.com/50' }}
+                style={styles.avatar}
+              />
             </TouchableOpacity>
+
+            {/* LIKE BUTTON */}
+            <TouchableOpacity onPress={() => handleToggleLike(item.id)} style={styles.actionButton}>
+              <Ionicons
+                name={item.is_liked ? 'heart' : 'heart-outline'}
+                size={32}
+                color={item.is_liked ? '#F44336' : '#fff'}
+              />
+              <Text style={styles.actionCount}>{item.likes_count || 0}</Text>
+            </TouchableOpacity>
+
+            {/* COMMENT BUTTON */}
+            <TouchableOpacity
+              onPress={() => setCommentModal({ visible: true, postId: item.id })}
+              style={styles.actionButton}>
+              <Ionicons name="chatbubble-outline" size={28} color="#fff" />
+              <Text style={styles.actionCount}>{item.comments_count || 0}</Text>
+            </TouchableOpacity>
+
+            {/* SHARE BUTTON */}
+            <TouchableOpacity style={styles.actionButton}>
+              <Ionicons name="share-outline" size={28} color="#fff" />
+            </TouchableOpacity>
+
+            {/* BOOK THIS LOOK BUTTON */}
+            {hasServiceLink && (
+              <TouchableOpacity
+                onPress={() => handleBookThisLook(item.id)}
+                style={[styles.actionButton, styles.bookButton]}>
+                <Ionicons name="calendar" size={28} color="#4CAF50" />
+                <Text style={[styles.actionCount, { color: '#4CAF50', fontWeight: 'bold' }]}>
+                  Rezervasyon
+                </Text>
+              </TouchableOpacity>
+            )}
           </View>
 
-          <Text style={styles.likes}>{item.likes_count || 0} beğenme</Text>
-          <View style={styles.descriptionRow}>
-            <Text style={styles.username}>{displayName}</Text>
-            <Text style={styles.description}> {item.description}</Text>
-          </View>
-          {item.service_name && (
-            <View style={styles.serviceTagContainer}>
-              <Ionicons name="pricetag" size={14} color="#aaa" />
-              <Text style={styles.serviceTag}> {item.service_name} • {item.price}</Text>
+          {/* BOTTOM INFO */}
+          <View style={styles.bottomInfo}>
+            <View style={styles.userInfo}>
+              <Text style={styles.username}>
+                @{item.user?.business_name || item.user?.full_name || 'Kullanıcı' || 'İşletme'}
+              </Text>
+              {item.caption && <Text style={styles.caption}>{item.caption}</Text>}
+              {item.service_name && (
+                <View style={styles.serviceTag}>
+                  <Ionicons name="cut-outline" size={14} color="#0095F6" />
+                  <Text style={styles.serviceTagText}>{item.service_name}</Text>
+                </View>
+              )}
             </View>
-          )}
+
+            {/* RECENT COMMENTS PREVIEW */}
+            {postComments[item.id] && postComments[item.id].length > 0 && (
+              <View style={styles.commentsPreview}>
+                {postComments[item.id].slice(0, 2).map((comment: any, idx: number) => (
+                  <View key={idx} style={styles.commentItem}>
+                    <Text style={styles.commentUsername}>
+                      {comment.profiles?.full_name || 'Kullanıcı'}:{' '}
+                    </Text>
+                    <Text style={styles.commentText}>{comment.comment}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
         </View>
       </View>
     );
   };
 
+  if (feed.length === 0 && !refreshing) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.emptyContainer}>
+          <ActivityIndicator size="large" color="#fff" />
+          <Text style={styles.emptyText}>Feed yükleniyor...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
-      <View style={styles.topBar}>
-        <Text style={styles.appTitle}>VibeBeauty</Text>
-        <TouchableOpacity onPress={fetchPosts}><Ionicons name="refresh-outline" size={24} color="#fff" /></TouchableOpacity>
-      </View>
-
-      {loading && !refreshing ? (
-        <View style={styles.loadingContainer}><ActivityIndicator size="large" color="#fff" /></View>
-      ) : (
-        <FlatList
-          data={posts}
-          renderItem={renderPost}
-          keyExtractor={item => item.id}
-          showsVerticalScrollIndicator={false}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}
-          ListEmptyComponent={
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyText}>Henüz hiç gönderi yok. 😔</Text>
+      <FlatList
+        ref={flatListRef}
+        data={feed}
+        renderItem={renderPost}
+        keyExtractor={(item) => item.id}
+        pagingEnabled
+        showsVerticalScrollIndicator={false}
+        snapToInterval={height}
+        snapToAlignment="start"
+        decelerationRate="fast"
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}
+        onEndReached={onEndReached}
+        onEndReachedThreshold={0.5}
+        ListFooterComponent={
+          feed.length > 0 ? (
+            <View style={styles.footer}>
+              <ActivityIndicator size="small" color="#fff" />
             </View>
-          }
-        />
-      )}
+          ) : null
+        }
+      />
+
+      {/* COMMENT MODAL */}
+      <Modal visible={commentModal.visible} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Yorumlar</Text>
+              <TouchableOpacity onPress={() => setCommentModal({ visible: false, postId: null })}>
+                <Ionicons name="close" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <FlatList
+              data={postComments[commentModal.postId || ''] || []}
+              keyExtractor={(item, index) => `${item.id}-${index}`}
+              renderItem={({ item }) => (
+                <View style={styles.commentRow}>
+                  <Image
+                    source={{ uri: item.profiles?.avatar_url || 'https://via.placeholder.com/40' }}
+                    style={styles.commentAvatar}
+                  />
+                  <View style={styles.commentContent}>
+                    <Text style={styles.commentAuthor}>
+                      {item.profiles?.full_name || 'Kullanıcı'}
+                    </Text>
+                    <Text style={styles.commentBody}>{item.comment}</Text>
+                  </View>
+                </View>
+              )}
+              ListEmptyComponent={
+                <Text style={styles.noComments}>Henüz yorum yok</Text>
+              }
+            />
+
+            <View style={styles.commentInputContainer}>
+              <TextInput
+                style={styles.commentInput}
+                placeholder="Yorum yaz..."
+                placeholderTextColor="#666"
+                value={newComment}
+                onChangeText={setNewComment}
+                multiline
+              />
+              <TouchableOpacity onPress={handleAddComment} style={styles.sendButton}>
+                <Ionicons name="send" size={20} color="#0095F6" />
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000' },
-  topBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 15, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#222' },
-  appTitle: { color: '#fff', fontSize: 24, fontWeight: 'bold' },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  card: { marginBottom: 20, borderBottomWidth: 1, borderBottomColor: '#222', paddingBottom: 15 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 10 },
-  userInfo: { flexDirection: 'row', alignItems: 'center' },
-  avatar: { width: 36, height: 36, borderRadius: 18, marginRight: 10, borderWidth: 1, borderColor: '#333' },
-  username: { color: '#fff', fontWeight: 'bold', fontSize: 14 },
-  badge: { color: '#aaa', fontSize: 10 },
-  mediaContainer: { width: width, height: 450, backgroundColor: '#111' },
+  emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  emptyText: { color: '#fff', marginTop: 16, fontSize: 16 },
+  postContainer: { width, height, backgroundColor: '#000' },
+  mediaContainer: { flex: 1, position: 'relative' },
   media: { width: '100%', height: '100%' },
-  footer: { paddingHorizontal: 12, paddingTop: 10 },
-  actionRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
-  leftActions: { flexDirection: 'row', alignItems: 'center' },
-  actionButton: { marginRight: 15 },
-  bookButton: { backgroundColor: '#fff', paddingHorizontal: 15, paddingVertical: 6, borderRadius: 20 },
-  bookButtonText: { color: '#000', fontWeight: 'bold', fontSize: 12 },
-  likes: { color: '#fff', fontWeight: 'bold', marginBottom: 4 },
-  descriptionRow: { flexDirection: 'row', flexWrap: 'wrap' },
-  description: { color: '#fff' },
-  serviceTagContainer: { flexDirection: 'row', alignItems: 'center', marginTop: 6, backgroundColor: '#222', alignSelf: 'flex-start', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 4 },
-  serviceTag: { color: '#ccc', fontSize: 12 },
-  emptyState: { alignItems: 'center', marginTop: 50 },
-  emptyText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  overlayGradient: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 300,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  rightActions: {
+    position: 'absolute',
+    right: 12,
+    bottom: 100,
+    alignItems: 'center',
+    gap: 24,
+  },
+  avatarButton: {
+    marginBottom: 8,
+    borderWidth: 2,
+    borderColor: '#fff',
+    borderRadius: 30,
+    padding: 2,
+  },
+  avatar: { width: 50, height: 50, borderRadius: 25 },
+  actionButton: {
+    alignItems: 'center',
+    gap: 4,
+  },
+  bookButton: {
+    backgroundColor: 'rgba(76, 175, 80, 0.2)',
+    padding: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#4CAF50',
+  },
+  actionCount: { color: '#fff', fontSize: 12, fontWeight: '600' },
+  bottomInfo: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 80,
+    padding: 16,
+    paddingBottom: 40,
+  },
+  userInfo: { marginBottom: 12 },
+  username: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 4 },
+  caption: { color: '#fff', fontSize: 14, lineHeight: 20 },
+  serviceTag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 149, 246, 0.2)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    gap: 4,
+  },
+  serviceTagText: { color: '#0095F6', fontSize: 12, fontWeight: '600' },
+  commentsPreview: { marginTop: 8 },
+  commentItem: {
+    flexDirection: 'row',
+    marginBottom: 4,
+  },
+  commentUsername: { color: '#fff', fontWeight: '600', fontSize: 13 },
+  commentText: { color: '#fff', fontSize: 13 },
+  footer: { padding: 20, alignItems: 'center' },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.9)',
+    justifyContent: 'flex-end',
+  },
+  modalContent: {
+    backgroundColor: '#1E1E1E',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    maxHeight: '80%',
+    padding: 20,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  modalTitle: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
+  commentRow: {
+    flexDirection: 'row',
+    marginBottom: 16,
+    gap: 12,
+  },
+  commentAvatar: { width: 40, height: 40, borderRadius: 20 },
+  commentContent: { flex: 1 },
+  commentAuthor: { color: '#fff', fontWeight: '600', marginBottom: 4 },
+  commentBody: { color: '#ccc', fontSize: 14 },
+  noComments: { color: '#666', textAlign: 'center', marginTop: 40 },
+  commentInputContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 16,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#333',
+  },
+  commentInput: {
+    flex: 1,
+    backgroundColor: '#111',
+    color: '#fff',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    maxHeight: 100,
+  },
+  sendButton: { padding: 8 },
 });

@@ -75,6 +75,7 @@ export default function DashboardScreen() {
       Alert.alert('Başarılı', newStatus === 'confirmed' ? 'Randevuyu onayladın! Para kasada. 🤑' : 'Randevu reddedildi.');
 
     } catch (error) {
+      console.error(error);
       Alert.alert('Hata', 'İşlem yapılamadı.');
     }
   }
@@ -115,6 +116,96 @@ export default function DashboardScreen() {
             <Text style={styles.statValue}>{stats.pending}</Text>
             <Text style={styles.statLabel}>Onay Bekleyen</Text>
           </View>
+        </View>
+
+        {/* HIZLI ERİŞİM MENÜSÜ */}
+        <View style={styles.quickAccessRow}>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={() => router.push('/business-crm')}>
+            <Ionicons name="people-outline" size={24} color="#0095F6" />
+            <Text style={styles.quickAccessText}>CRM</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={() => router.push('/business-calendar' as any)}>
+            <Ionicons name="calendar-outline" size={24} color="#4CAF50" />
+            <Text style={styles.quickAccessText}>Takvim</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={async () => {
+            const { data: { user } } = await supabase.auth.getUser();
+            if (user) {
+              // profiles tablosundan business_id'yi al
+              const { data: profile } = await supabase
+                .from('profiles')
+                .select('id')
+                .eq('id', user.id)
+                .eq('role', 'business')
+                .single();
+              
+              if (profile) {
+                router.push(`/service-management?business_id=${profile.id}` as any);
+              } else {
+                // Eğer profile yoksa direkt user.id kullan
+                router.push(`/service-management?business_id=${user.id}` as any);
+              }
+            }
+          }}>
+            <Ionicons name="list-outline" size={24} color="#9C27B0" />
+            <Text style={styles.quickAccessText}>Hizmetler</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={() => router.push('/campaign-builder' as any)}>
+            <Ionicons name="megaphone-outline" size={24} color="#FFC107" />
+            <Text style={styles.quickAccessText}>Pazarlama</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* İKİNCİ SATIR */}
+        <View style={styles.quickAccessRow}>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={async () => {
+            const { data: { user } } = await supabase.auth.getUser();
+            if (user) {
+              const { data: profile } = await supabase
+                .from('profiles')
+                .select('id')
+                .eq('id', user.id)
+                .eq('role', 'business')
+                .single();
+              
+              if (profile) {
+                router.push(`/staff-service-assignment?business_id=${profile.id}` as any);
+              } else {
+                router.push(`/staff-service-assignment?business_id=${user.id}` as any);
+              }
+            }
+          }}>
+            <Ionicons name="person-add-outline" size={24} color="#00BCD4" />
+            <Text style={styles.quickAccessText}>Personel-Hizmet</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={async () => {
+            const { data: { user } } = await supabase.auth.getUser();
+            if (user) {
+              const { data: profile } = await supabase
+                .from('profiles')
+                .select('id')
+                .eq('id', user.id)
+                .eq('role', 'business')
+                .single();
+              
+              if (profile) {
+                router.push(`/staff-shift-management?business_id=${profile.id}` as any);
+              } else {
+                router.push(`/staff-shift-management?business_id=${user.id}` as any);
+              }
+            }
+          }}>
+            <Ionicons name="time-outline" size={24} color="#FF9800" />
+            <Text style={styles.quickAccessText}>Vardiyalar</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={() => router.push('/pos-checkout' as any)}>
+            <Ionicons name="cash-outline" size={24} color="#F44336" />
+            <Text style={styles.quickAccessText}>POS Satış</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickAccessCard} onPress={() => router.push('/notifications' as any)}>
+            <Ionicons name="notifications-outline" size={24} color="#FF9800" />
+            <Text style={styles.quickAccessText}>Bildirimler</Text>
+          </TouchableOpacity>
         </View>
 
         {/* BEKLEYEN RANDEVULAR LİSTESİ */}
@@ -166,6 +257,17 @@ const styles = StyleSheet.create({
   
   statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 25 },
   statCard: { width: '48%', padding: 15, borderRadius: 12, borderWidth: 1, borderColor: '#333' },
+  quickAccessRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 25, gap: 10 },
+  quickAccessCard: {
+    flex: 1,
+    backgroundColor: '#1E1E1E',
+    padding: 15,
+    borderRadius: 12,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  quickAccessText: { color: '#fff', fontSize: 12, marginTop: 8, fontWeight: '600' },
   iconBgGreen: { width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(76, 175, 80, 0.1)', justifyContent: 'center', alignItems: 'center', marginBottom: 10 },
   iconBgOrange: { width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(255, 193, 7, 0.1)', justifyContent: 'center', alignItems: 'center', marginBottom: 10 },
   statValue: { color: '#fff', fontSize: 22, fontWeight: 'bold', marginBottom: 2 },
